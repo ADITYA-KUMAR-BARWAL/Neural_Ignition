@@ -20,7 +20,7 @@ class MainWindow(QMainWindow):
 
         # Core modules
         self.kin = StewartKinematics()
-        self.serial = SerialComm(port="COM4", baud=9600)
+        self.serial = SerialComm(port="COM4", baud=115200)
 
         # Widgets
         self.panel = ControlPanel()
@@ -50,9 +50,21 @@ class MainWindow(QMainWindow):
         # Wire signals
         self.panel.poseChanged.connect(self._on_pose)
         self.panel.geometryChanged.connect(self._on_geometry)
+        self.panel.manualServoOverride.connect(self._on_manual_servo)
 
-        # Initial computation
+        # Serial send is suppressed until user actively moves a slider.
+        # This prevents the GUI from overriding the Arduino's safe home
+        # position (50°) on startup.
+        self._armed = False
+
+        # Initial computation (visualization only, no serial send)
         self._on_pose(0, 0, 0, 0, 0, 0)
+
+        # Override table to match firmware safe home (127°)
+        self.panel.update_servo_angles([127.0] * 6, True)
+
+        # Now arm for future interactions
+        self._armed = True
 
         # Try to connect to Arduino
         self._try_connect()
@@ -89,9 +101,18 @@ class MainWindow(QMainWindow):
         angles, base, horns, plat, center, valid = \
             self.kin.inverse_kinematics(x, y, z, roll, pitch, yaw)
 
-        self.view3d.update_platform(base, horns, plat, center, valid)
+        self.view3d.update_platform(
+            base, horns, plat, center, valid,
+            servo_angles=angles,
+            base_angles=self.kin.base_angles_rad,
+            servo_dir=self.kin.servo_dir,
+            horn_length=self.kin.horn_length,
+        )
         self.panel.update_servo_angles(angles, valid)
-        self.serial.send_angles(angles.tolist())
+
+        # Only send to Arduino after user has actively changed a slider
+        if self._armed:
+            self.serial.send_angles(angles.tolist())
 
         status = "VALID" if valid else "⚠ OUT OF RANGE"
         self.statusBar().showMessage(
@@ -99,12 +120,10 @@ class MainWindow(QMainWindow):
             f"({roll:.1f}°, {pitch:.1f}°, {yaw:.1f}°)  |  {status}"
         )
 
-    def _on_geometry(self, base_r, plat_r, horn, rod):
+    def _on_geometry(self, horn, rod):
         """Update geometry parameters and recompute."""
         try:
             self.kin.update_params(
-                base_radius=base_r,
-                platform_radius=plat_r,
                 horn_length=horn,
                 rod_length=rod
             )
@@ -120,6 +139,13 @@ class MainWindow(QMainWindow):
             )
         except ValueError as e:
             self.statusBar().showMessage(f"Geometry error: {e}")
+
+    def _on_manual_servo(self, angles):
+        """User manually typed servo angles — send directly to Arduino."""
+        self.serial.send_angles(angles)
+        self.statusBar().showMessage(
+            f"Manual Override: [{', '.join(f'{a:.1f}°' for a in angles)}]"
+        )
 
     def closeEvent(self, event):
         self.serial.disconnect()

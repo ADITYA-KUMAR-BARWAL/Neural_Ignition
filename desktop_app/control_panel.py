@@ -2,13 +2,13 @@
 Left-side control panel: dimension inputs, 6 DOF sliders, servo angle table.
 """
 
-import numpy as np
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QSlider, QPushButton, QGroupBox,
-    QTableWidget, QTableWidgetItem, QScrollArea, QFrame, QSizePolicy
+    QTableWidget, QTableWidgetItem, QScrollArea, QFrame
 )
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 
 
 class _DOFSlider(QWidget):
@@ -88,11 +88,13 @@ class _DOFSlider(QWidget):
 class ControlPanel(QWidget):
     """Left panel containing dimension controls, IK sliders, and servo readout."""
     poseChanged = Signal(float, float, float, float, float, float)  # x y z roll pitch yaw
-    geometryChanged = Signal(float, float, float, float)  # base_r plat_r horn rod
+    geometryChanged = Signal(float, float)  # horn rod
+    manualServoOverride = Signal(list)  # 6 servo angles manually entered
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(380)
+        self._block_table = False  # prevent IK updates from triggering manual override
         self._build_ui()
 
     def _build_ui(self):
@@ -117,8 +119,8 @@ class ControlPanel(QWidget):
         dim_grid = QGridLayout()
         dim_grid.setSpacing(6)
 
-        dim_labels = ["base_r", "plat_r", "horn", "rod"]
-        dim_defaults = [80.0, 50.0, 25.0, 130.0]
+        dim_labels = ["horn", "rod"]
+        dim_defaults = [25.0, 130.0]
         self.dim_inputs = {}
 
         for col, (name, default) in enumerate(zip(dim_labels, dim_defaults)):
@@ -178,7 +180,7 @@ class ControlPanel(QWidget):
         btn_row.addWidget(self.reset_btn)
         main_lay.addLayout(btn_row)
 
-        # ── Servo Angles Table ────
+        # ── Servo Angles Table (editable angle column) ────
         servo_group = QGroupBox("✦ SERVO ANGLES")
         servo_lay = QVBoxLayout()
 
@@ -186,18 +188,28 @@ class ControlPanel(QWidget):
         self.servo_table.setHorizontalHeaderLabels(["SERVO", "ANGLE (°)"])
         self.servo_table.horizontalHeader().setStretchLastSection(True)
         self.servo_table.verticalHeader().setVisible(False)
-        self.servo_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.servo_table.setSelectionMode(QTableWidget.NoSelection)
+        self.servo_table.setSelectionMode(QTableWidget.SingleSelection)
         self.servo_table.setMaximumHeight(210)
 
         for i in range(6):
             name_item = QTableWidgetItem(f"  S{i+1}")
-            angle_item = QTableWidgetItem("90.0")
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)  # servo name NOT editable
+            angle_item = QTableWidgetItem("127.0")
             angle_item.setTextAlignment(Qt.AlignCenter)
             self.servo_table.setItem(i, 0, name_item)
             self.servo_table.setItem(i, 1, angle_item)
 
+        # Connect cell edits to manual override handler
+        self.servo_table.cellChanged.connect(self._on_servo_table_edited)
+
         servo_lay.addWidget(self.servo_table)
+
+        # Hint label
+        hint = QLabel("⤷ double-click angle to override")
+        hint.setObjectName("valueLabel")
+        hint.setAlignment(Qt.AlignCenter)
+        servo_lay.addWidget(hint)
+
         servo_group.setLayout(servo_lay)
         main_lay.addWidget(servo_group)
 
@@ -224,7 +236,7 @@ class ControlPanel(QWidget):
     def _on_dim_changed(self):
         try:
             vals = [float(self.dim_inputs[k].text())
-                    for k in ("base_r", "plat_r", "horn", "rod")]
+                    for k in ("horn", "rod")]
             self.geometryChanged.emit(*vals)
         except ValueError:
             pass
@@ -237,10 +249,32 @@ class ControlPanel(QWidget):
 
     # ── Public ──────────────────────────────────────────────────────
     def update_servo_angles(self, angles, valid: bool):
+        self._block_table = True  # prevent triggering manual override
         for i, a in enumerate(angles[:6]):
             item = self.servo_table.item(i, 1)
             if item:
                 item.setText(f"{a:.1f}")
+                # Color the angle red if out of safe range
+                if a <= 5.0 or a >= 175.0:
+                    item.setForeground(QColor("#ff2d6a"))
+                else:
+                    item.setForeground(QColor("#00ffcc"))
+        self._block_table = False
+
+    def _on_servo_table_edited(self, row, col):
+        """User manually edited a servo angle — send override."""
+        if self._block_table or col != 1:
+            return
+        try:
+            angles = []
+            for i in range(6):
+                item = self.servo_table.item(i, 1)
+                val = float(item.text()) if item else 90.0
+                val = max(0.0, min(180.0, val))
+                angles.append(val)
+            self.manualServoOverride.emit(angles)
+        except ValueError:
+            pass
 
     def set_connection_status(self, connected: bool):
         if connected:
