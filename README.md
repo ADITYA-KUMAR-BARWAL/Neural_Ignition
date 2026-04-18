@@ -408,4 +408,4 @@ Adjust `PULSE_FORWARD` / `PULSE_BACKWARD` if your servos spin the wrong directio
 
 ## License
 
-This project was developed for the **Innovathon** hackathon. See the repository for licensing details.
+This project was developed for the **Innovathon** hackathon. See the repository for licensing details
