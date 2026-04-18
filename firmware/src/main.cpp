@@ -1,22 +1,22 @@
 /*
  * ══════════════════════════════════════════════════════════════════════
  *  Stewart Platform 6-DOF Servo Controller
- *  Hardware: Arduino Uno + PCA9685 PWM Driver + 6× MG996R Servos
+ *  Open-Loop Dead Reckoning for 360° Continuous Rotation Servos
+ *  Hardware: Arduino Uno + PCA9685 PWM Driver + 6× Continuous Servos
  *  Protocol: '<A1:90.0,A2:90.0,A3:90.0,A4:90.0,A5:90.0,A6:90.0>\n'
  * ══════════════════════════════════════════════════════════════════════
  *
+ *  Control Strategy — "Spin and Kill":
+ *    1. Receive absolute target angles from Python IK engine
+ *    2. Calculate delta = targetAngle - currentAngle
+ *    3. Spin servo in the correct direction for (|delta| * TIME_PER_DEGREE_MS) ms
+ *    4. Cut power (setPWM = 0) to stop rotation
+ *    5. Update currentAngle = targetAngle (dead reckoning)
+ *
+ *  All 6 servos move simultaneously using non-blocking millis() timers.
+ *
  *  PCA9685 I2C address: 0x40 (default)
  *  PWM frequency: 50 Hz (standard for hobby servos)
- *  MG996R specs:
- *    - Operating voltage: 4.8V–7.2V
- *    - Pulse width: 500µs (0°) to 2500µs (180°)
- *    - Stall torque: 11 kg·cm (at 6V)
- *    - 0.5kg load well within capability
- *
- *  Safety constraints:
- *    - Hard angle limits: 10°–170° (prevent mechanical binding)
- *    - Slew rate limiting: max 2°/ms to prevent sudden jolts
- *    - Startup: all servos move to 50° (safe home) immediately
  */
 
 #include <Arduino.h>
@@ -27,19 +27,22 @@
 #define NUM_SERVOS       6
 #define SERIAL_BAUD      115200
 
-// PCA9685 pulse ticks for MG996R at 50 Hz (4096-step resolution)
-// 500µs  → tick ~102   (0°)
-// 1500µs → tick ~307   (90°)
-// 2500µs → tick ~512   (180°)
-#define SERVO_MIN_TICK   102     // 0 degrees
-#define SERVO_MAX_TICK   512     // 180 degrees
+// ── Open-Loop Dead Reckoning Tuning ──────────────────────────────
+// TIME_PER_DEGREE_MS: How many milliseconds of spin equals 1° of rotation.
+// This is THE critical tuning constant. Measure your servo's speed and adjust.
+// Example: if servo does 60 RPM → 360°/sec → 1°/2.78ms → set to ~3.
+#define TIME_PER_DEGREE_MS   5
 
-// Safety limits (degrees) — prevents mechanical over-extension
-#define ANGLE_MIN        10.0f
-#define ANGLE_MAX        170.0f
+// PCA9685 pulse tick values for continuous rotation direction control.
+// At 50 Hz (20ms period), 4096 ticks per period:
+//   ~307 ticks = 1500µs = stop (for most continuous servos)
+//   >307 = forward spin,  <307 = backward spin
+// Adjust these for your specific servos.
+#define PULSE_FORWARD    400    // CW spin pulse tick
+#define PULSE_BACKWARD   200    // CCW spin pulse tick
 
-// Slew rate limit (degrees per update cycle to prevent jerk)
-#define MAX_SLEW_RATE    5.0f    // degrees per update
+// Ignore angle deltas smaller than this (prevents micro-jitter)
+#define DEAD_ZONE_DEG    0.5f
 
 // Serial parsing
 #define BUF_SIZE         128
@@ -52,13 +55,16 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 // S1→ch0, S2→ch4, S3→ch6, S4→ch9, S5→ch11, S6→ch15
 const uint8_t servoChannels[NUM_SERVOS] = {0, 4, 6, 9, 11, 15};
 
-// Current and target angles — 50° safe home position
+// Dead-reckoned position tracking — 127° safe home position
 #define SAFE_HOME_ANGLE  127.0f
 float currentAngles[NUM_SERVOS]  = {SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE};
 float targetAngles[NUM_SERVOS]   = {SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE, SAFE_HOME_ANGLE};
 
-// Per-servo trim offsets (calibration, adjust per physical build)
-float servoTrim[NUM_SERVOS] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+// Per-servo movement state (non-blocking timers)
+bool          servoMoving[NUM_SERVOS]    = {false, false, false, false, false, false};
+unsigned long moveStartMs[NUM_SERVOS]    = {0, 0, 0, 0, 0, 0};
+unsigned long moveDurationMs[NUM_SERVOS] = {0, 0, 0, 0, 0, 0};
+bool          moveProcessed[NUM_SERVOS]  = {true, true, true, true, true, true};
 
 // Serial buffer
 char buffer[BUF_SIZE];
@@ -68,48 +74,7 @@ unsigned long msgStartTime = 0;
 
 // Timing
 unsigned long lastUpdateMs = 0;
-const unsigned long UPDATE_INTERVAL_MS = 20;  // 50 Hz servo update
-
-// ── Helper Functions ──────────────────────────────────────────────
-
-/**
- * Convert angle (0–180°) to PCA9685 pulse tick value.
- */
-uint16_t angleToPulse(float angle) {
-    angle = constrain(angle, 0.0f, 180.0f);
-    return (uint16_t)map((long)(angle * 10), 0, 1800,
-                         SERVO_MIN_TICK, SERVO_MAX_TICK);
-}
-
-/**
- * Clamp angle to safe physical range.
- */
-float clampAngle(float angle) {
-    if (angle < ANGLE_MIN) return ANGLE_MIN;
-    if (angle > ANGLE_MAX) return ANGLE_MAX;
-    return angle;
-}
-
-/**
- * Apply slew rate limiting — move toward target at controlled speed.
- */
-float slewLimit(float current, float target, float maxRate) {
-    float diff = target - current;
-    if (diff > maxRate)  return current + maxRate;
-    if (diff < -maxRate) return current - maxRate;
-    return target;
-}
-
-/**
- * Write angle to a specific servo channel on PCA9685.
- */
-void setServo(uint8_t idx, float angle) {
-    if (idx >= NUM_SERVOS) return;
-    float trimmed = angle + servoTrim[idx];
-    trimmed = constrain(trimmed, 0.0f, 180.0f);
-    uint16_t pulse = angleToPulse(trimmed);
-    pwm.setPWM(servoChannels[idx], 0, pulse);
-}
+const unsigned long UPDATE_INTERVAL_MS = 10;  // 100 Hz update check for precise timing
 
 // ── Serial Parsing ────────────────────────────────────────────────
 
@@ -136,7 +101,6 @@ void parseAndApply() {
             } else {
                 angles[count] = atof(token);
             }
-            angles[count] = clampAngle(angles[count]);
             count++;
             token = strtok(NULL, ",");
         }
@@ -145,7 +109,6 @@ void parseAndApply() {
         char* token = strtok(buffer, ",");
         while (token != NULL && count < NUM_SERVOS) {
             angles[count] = atof(token);
-            angles[count] = clampAngle(angles[count]);
             count++;
             token = strtok(NULL, ",");
         }
@@ -155,12 +118,17 @@ void parseAndApply() {
     if (count == NUM_SERVOS) {
         for (int i = 0; i < NUM_SERVOS; i++) {
             targetAngles[i] = angles[i];
+            moveProcessed[i] = false;  // Flag: new target needs processing
         }
 
-        // Send acknowledgement
+        // Send acknowledgement with delta info
         Serial.print("OK:");
         for (int i = 0; i < NUM_SERVOS; i++) {
+            float delta = targetAngles[i] - currentAngles[i];
             Serial.print(targetAngles[i], 1);
+            Serial.print("(d");
+            Serial.print(delta, 1);
+            Serial.print(")");
             if (i < NUM_SERVOS - 1) Serial.print(",");
         }
         Serial.println();
@@ -203,23 +171,74 @@ void processSerial() {
     }
 }
 
-// ── Servo Update Loop ─────────────────────────────────────────────
+// ── Servo Update Loop — "Spin and Kill" ───────────────────────────
 
 /**
- * Smooth servo movement with slew rate limiting.
- * Called at 50 Hz from main loop.
+ * Non-blocking servo movement using dead reckoning.
+ * Called at high frequency from main loop.
+ *
+ * For each servo independently:
+ *   1. If a new target arrived → calculate delta, start spinning
+ *   2. If currently spinning → check if duration elapsed
+ *   3. If duration elapsed → KILL power, update position
  */
 void updateServos() {
-    for (int i = 0; i < NUM_SERVOS; i++) {
-        float prev = currentAngles[i];
-        currentAngles[i] = slewLimit(currentAngles[i], targetAngles[i], MAX_SLEW_RATE);
+    unsigned long now = millis();
 
-        if (currentAngles[i] != prev) {
-            // Still moving — drive the servo
-            setServo(i, currentAngles[i]);
-        } else if (currentAngles[i] == targetAngles[i]) {
-            // Reached target — stop driving (turn off PWM output)
-            pwm.setPWM(servoChannels[i], 0, 0);
+    for (int i = 0; i < NUM_SERVOS; i++) {
+
+        // ── Step 1: Process new target (if not yet processed) ──
+        if (!moveProcessed[i] && !servoMoving[i]) {
+            float delta = targetAngles[i] - currentAngles[i];
+
+            // Dead zone: skip tiny deltas (prevent jitter)
+            if (fabs(delta) < DEAD_ZONE_DEG) {
+                currentAngles[i] = targetAngles[i];
+                moveProcessed[i] = true;
+                continue;
+            }
+
+            // Calculate spin duration from delta magnitude
+            moveDurationMs[i] = (unsigned long)(fabs(delta) * TIME_PER_DEGREE_MS);
+            moveStartMs[i] = now;
+            servoMoving[i] = true;
+            moveProcessed[i] = true;
+
+            // Choose direction and START spinning
+            uint16_t pulse = (delta > 0) ? PULSE_FORWARD : PULSE_BACKWARD;
+            pwm.setPWM(servoChannels[i], 0, pulse);
+
+            // Debug output
+            Serial.print("  S");
+            Serial.print(i + 1);
+            Serial.print(": ");
+            Serial.print(currentAngles[i], 1);
+            Serial.print("° → ");
+            Serial.print(targetAngles[i], 1);
+            Serial.print("° (Δ");
+            Serial.print(delta, 1);
+            Serial.print("° = ");
+            Serial.print(moveDurationMs[i]);
+            Serial.println("ms)");
+        }
+
+        // ── Step 2: Check if spinning servo has reached its duration ──
+        if (servoMoving[i]) {
+            if (now - moveStartMs[i] >= moveDurationMs[i]) {
+                // ═══ THE KILL SWITCH ═══
+                // Cut power immediately to stop rotation
+                pwm.setPWM(servoChannels[i], 0, 0);
+
+                // Update dead-reckoned position
+                currentAngles[i] = targetAngles[i];
+                servoMoving[i] = false;
+
+                Serial.print("  S");
+                Serial.print(i + 1);
+                Serial.print(": STOPPED at ");
+                Serial.print(currentAngles[i], 1);
+                Serial.println("°");
+            }
         }
     }
 }
@@ -227,42 +246,27 @@ void updateServos() {
 // ── Startup ───────────────────────────────────────────────────────
 
 /**
- * Immediately lock all PCA9685 channels to the safe home angle.
- * Called FIRST in setup() before any serial activity.
+ * Initialize all servos to stopped (no power).
+ * Continuous rotation servos cannot be "positioned" —
+ * we just ensure they're not spinning on boot.
  */
-void lockToSafeHome() {
-    uint16_t homePulse = angleToPulse(SAFE_HOME_ANGLE);
+void initServos() {
     for (int i = 0; i < NUM_SERVOS; i++) {
-        pwm.setPWM(servoChannels[i], 0, homePulse);
-    }
-}
-
-/**
- * Slowly move all servos to safe home position on startup.
- * Prevents sudden movements that could damage the mechanism.
- */
-void centerServos() {
-    Serial.println("Centering servos...");
-    for (int step = 0; step <= 20; step++) {
-        for (int i = 0; i < NUM_SERVOS; i++) {
-            float angle = currentAngles[i];  // Use the initial angle from the array
-            setServo(i, angle);
-        }
-        delay(50);
+        // Kill all channels — no spinning on startup
+        pwm.setPWM(servoChannels[i], 0, 0);
     }
 
-    // Print current angle of each servo after reset
-    Serial.println("─── Servo Reset Complete ───");
+    Serial.println("─── Servo Init (Dead Reckoning) ───");
     for (int i = 0; i < NUM_SERVOS; i++) {
         Serial.print("  S");
         Serial.print(i + 1);
         Serial.print(" (ch ");
         Serial.print(servoChannels[i]);
-        Serial.print("): ");
+        Serial.print("): assumed ");
         Serial.print(currentAngles[i], 1);
         Serial.println("°");
     }
-    Serial.println("────────────────────────────");
+    Serial.println("────────────────────────────────────");
 }
 
 // ── Arduino Entry Points ──────────────────────────────────────────
@@ -277,21 +281,20 @@ void setup() {
 
     delay(10);
 
-    // IMMEDIATELY lock all servos to safe home angle (50°)
-    // before any serial communication begins
-    lockToSafeHome();
-
-    // Then smoothly verify position (already at target, so minimal movement)
-    centerServos();
+    // Ensure all servos are STOPPED (no power) on boot
+    initServos();
 
     Serial.println("═══════════════════════════════════════");
     Serial.println("  Stewart Platform Controller Ready");
-    Serial.println("  PCA9685 + 6x MG996R @ 50Hz PWM");
-    Serial.print("  Safety range: ");
-    Serial.print(ANGLE_MIN, 0);
-    Serial.print("° - ");
-    Serial.print(ANGLE_MAX, 0);
-    Serial.println("°");
+    Serial.println("  MODE: Open-Loop Dead Reckoning");
+    Serial.println("  PCA9685 + 6x Continuous Rotation");
+    Serial.print("  Time/degree: ");
+    Serial.print(TIME_PER_DEGREE_MS);
+    Serial.println(" ms");
+    Serial.print("  Fwd pulse: ");
+    Serial.print(PULSE_FORWARD);
+    Serial.print("  Rev pulse: ");
+    Serial.println(PULSE_BACKWARD);
     Serial.println("═══════════════════════════════════════");
 }
 
@@ -299,7 +302,7 @@ void loop() {
     // Process incoming serial commands
     processSerial();
 
-    // Update servo positions at fixed rate
+    // Update servo movements at fixed rate
     unsigned long now = millis();
     if (now - lastUpdateMs >= UPDATE_INTERVAL_MS) {
         lastUpdateMs = now;

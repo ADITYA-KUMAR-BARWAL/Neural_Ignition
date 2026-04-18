@@ -1,4 +1,0 @@
-[wokwi]
-version = 1
-# Point it directly to your source file instead of the binary
-firmware = 'src/main.cpp'

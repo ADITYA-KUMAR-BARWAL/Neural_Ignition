@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self.panel.poseChanged.connect(self._on_pose)
         self.panel.geometryChanged.connect(self._on_geometry)
         self.panel.manualServoOverride.connect(self._on_manual_servo)
+        self.panel.zeroHardware.connect(self._on_zero_hardware)
 
         # Serial send is suppressed until user actively moves a slider.
         # This prevents the GUI from overriding the Arduino's safe home
@@ -145,6 +146,31 @@ class MainWindow(QMainWindow):
         self.serial.send_angles(angles)
         self.statusBar().showMessage(
             f"Manual Override: [{', '.join(f'{a:.1f}°' for a in angles)}]"
+        )
+
+    def _on_zero_hardware(self):
+        """Re-sync the digital twin to physical home position.
+
+        Resets all IK sliders to zero and recomputes angles to home,
+        but does NOT send any serial commands. The user is expected to
+        have manually positioned the physical servos to the level/home
+        pose before clicking this button.
+        """
+        # Temporarily disarm serial to suppress any sends during reset
+        was_armed = self._armed
+        self._armed = False
+
+        # Reset all sliders to zero (home pose)
+        self.panel.reset_pose()
+
+        # Recompute IK at home pose — updates visualization + table
+        self._on_pose(0, 0, 0, 0, 0, 0)
+
+        # Restore armed state
+        self._armed = was_armed
+
+        self.statusBar().showMessage(
+            "⌖ Hardware zeroed — digital twin re-synced to home position"
         )
 
     def closeEvent(self, event):

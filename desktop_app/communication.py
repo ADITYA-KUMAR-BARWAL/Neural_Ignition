@@ -13,8 +13,8 @@ from typing import List, Optional
 class SerialComm:
     """Thread-safe serial communication wrapper with offline fallback."""
 
-    # MG996R physical constraints (degrees)
-    SERVO_MIN = 0.0
+    # Servo operating range (degrees)
+    SERVO_MIN = 90.0
     SERVO_MAX = 180.0
 
     def __init__(self, port: str = "COM4", baud: int = 115200):
@@ -55,7 +55,7 @@ class SerialComm:
         if self._serial and self._serial.is_open:
             try:
                 # Send neutral position before disconnecting
-                neutral = [50.0] * 6
+                neutral = [127.0] * 6
                 self._send_raw(neutral)
                 time.sleep(0.05)
                 self._serial.close()

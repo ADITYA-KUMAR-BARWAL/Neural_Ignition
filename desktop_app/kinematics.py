@@ -198,7 +198,7 @@ class StewartKinematics:
         self.servo_dir = np.array([1, -1, 1, -1, 1, -1], dtype=float)
 
         # ── Home height calculation ──────────────────────────────────
-        # Scan α ∈ [0°, 180°] for each leg to find max achievable height,
+        # Scan α ∈ [90°, 180°] for each leg to find max achievable height,
         # then offset downward to center the Z workspace.
         min_max_height = float('inf')
         for i in range(6):
@@ -214,7 +214,7 @@ class StewartKinematics:
 
             # Scan alpha to find max achievable height for this leg
             best_h = 0.0
-            for alpha_deg in range(0, 181):
+            for alpha_deg in range(90, 181):
                 alpha = np.radians(alpha_deg)
                 eff_tang = tang_comp - self.horn_length * np.cos(alpha) * d
                 horiz_sq = rad_comp ** 2 + eff_tang ** 2
@@ -256,12 +256,12 @@ class StewartKinematics:
             roll, pitch, yaw: rotation in degrees (ZYX Euler convention)
 
         Returns:
-            servo_angles (6,): degrees [0-180]
+            servo_angles (6,): degrees [90-180]
             base_positions (6,3): base anchor XYZ
             horn_tips (6,3): horn tip XYZ
             platform_positions (6,3): platform anchor XYZ in world frame
             platform_center (3,): center of moved platform
-            valid: True if all angles are within [0, 180]
+            valid: True if all angles are within [90, 180]
         """
         R = self.rotation_matrix(roll, pitch, yaw)
         T = np.array([x, y, z + self.home_height])
@@ -305,20 +305,20 @@ class StewartKinematics:
             base_a = np.arctan2(f, e)
             offset = np.arccos(cos_arg)
 
-            # Two candidate solutions — pick the one closest to 90° (neutral)
+            # Two candidate solutions — pick the one closest to 135° (midpoint of 90-180)
             a1 = np.degrees(base_a + offset)
             a2 = np.degrees(base_a - offset)
 
-            best = 90.0
+            best = 135.0
             best_dist = 999.0
             for cand in [a1, a2, a1 + 360, a2 + 360, a1 - 360, a2 - 360]:
-                if -5 <= cand <= 185:
-                    dist = abs(cand - 90.0)
+                if 85 <= cand <= 185:
+                    dist = abs(cand - 135.0)
                     if dist < best_dist:
                         best_dist = dist
                         best = cand
 
-            servo_angles[i] = np.clip(best, 0.0, 180.0)
+            servo_angles[i] = np.clip(best, 90.0, 180.0)
 
             # Compute horn tip position for visualization
             alpha_r = np.radians(servo_angles[i])

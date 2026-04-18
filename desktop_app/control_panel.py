@@ -90,6 +90,7 @@ class ControlPanel(QWidget):
     poseChanged = Signal(float, float, float, float, float, float)  # x y z roll pitch yaw
     geometryChanged = Signal(float, float)  # horn rod
     manualServoOverride = Signal(list)  # 6 servo angles manually entered
+    zeroHardware = Signal()  # re-sync digital twin to physical home position
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -172,12 +173,22 @@ class ControlPanel(QWidget):
         ik_group.setLayout(ik_lay)
         main_lay.addWidget(ik_group)
 
-        # ── Reset button ────
+        # ── Buttons ────
         btn_row = QHBoxLayout()
         self.reset_btn = QPushButton("⟲  RESET")
         self.reset_btn.setObjectName("pinkButton")
         self.reset_btn.clicked.connect(self.reset_pose)
         btn_row.addWidget(self.reset_btn)
+
+        self.zero_btn = QPushButton("⌖  ZERO HARDWARE")
+        self.zero_btn.setObjectName("pinkButton")
+        self.zero_btn.setToolTip(
+            "Re-sync digital twin to physical home position.\n"
+            "Manually level the platform first, then click.\n"
+            "No serial commands are sent."
+        )
+        self.zero_btn.clicked.connect(self.zeroHardware.emit)
+        btn_row.addWidget(self.zero_btn)
         main_lay.addLayout(btn_row)
 
         # ── Servo Angles Table (editable angle column) ────
@@ -255,7 +266,7 @@ class ControlPanel(QWidget):
             if item:
                 item.setText(f"{a:.1f}")
                 # Color the angle red if out of safe range
-                if a <= 5.0 or a >= 175.0:
+                if a <= 95.0 or a >= 175.0:
                     item.setForeground(QColor("#ff2d6a"))
                 else:
                     item.setForeground(QColor("#00ffcc"))
@@ -270,7 +281,7 @@ class ControlPanel(QWidget):
             for i in range(6):
                 item = self.servo_table.item(i, 1)
                 val = float(item.text()) if item else 90.0
-                val = max(0.0, min(180.0, val))
+                val = max(90.0, min(180.0, val))
                 angles.append(val)
             self.manualServoOverride.emit(angles)
         except ValueError:
